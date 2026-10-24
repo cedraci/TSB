@@ -24,6 +24,10 @@ Keys:  F8 = pause/resume everything, F9 = toggle movement, Ctrl+C = quit.
   during sacrifice events it circles inside the sacrifice zone; during
   statue events it roams in long runs until the statues get markers; during
   rift events it goes to each rift and loops inside it until it closes.
+  After 45 minutes of game time (MOVE_FOR) it stops roaming and events, and
+  just loops in a small circle around where it stood to sweep up nearby XP
+  orbs; card picks carry on. Game time is the longest spell "TEMPS" in the
+  spell stats panel (Shift then E), which the bot opens when it is not shown.
 """
 import ctypes
 import ctypes.wintypes as w
@@ -53,6 +57,8 @@ DEBUG = "--debug" in sys.argv
 DEBUG_DIR = os.path.join(HERE, "debug")
 DEBUG_KEEP = 200                      # newest screenshots kept in debug/
 VK_F8, VK_F9 = 0x77, 0x78
+MOVE_FOR = 45 * 60                    # stop roaming after this much game time
+SETTLE_ORBIT = 50                     # px (960x540) loop radius once settled
 
 # Movement tuning (full-resolution pixels, 1920x1080 reference).
 # Enemies look too much like the terrain to be seen reliably, so the bot
@@ -112,6 +118,20 @@ CHASE_FOR = 0.4                       # re-aim at the mushroom this often
 MARKER_MIN_PX = 60                    # skull ~280 px, cow head ~200; digits < 20
 CRAB_PURSUE = 4.0
 SCAN = {"up": 0x11, "left": 0x1E, "down": 0x1F, "right": 0x20}  # Z Q S D on AZERTY
+# Game clock: the spell stats panel ("STATISTIQUES DES SORTS", toggled with
+# Shift then E) stays open during play; each spell shows how long it has been
+# active, so the oldest one (the starting spell) gives the run time. Read at
+# 1920x1080: white digits matched against templates, colon dots skipped.
+STATS_TITLE = os.path.join(HERE, "stats_title_template.png")
+TIME_DIGITS = os.path.join(HERE, "time_digits.npy")   # 0-9, 14x10 each
+STATS_TITLE_BOX = (55, 222, 450, 256)
+STATS_TITLE_MATCH = 25                # 0 when shown
+TEMPS_ROWS = (394, 539, 684)          # "TEMPS" value row of the 3 spell slots
+TEMPS_X = (380, 565)
+DIGIT_MATCH = 40                      # mean abs diff; reads ~5-20, gaps ~60+
+CLOCK_EVERY = 5.0                     # seconds between clock reads
+OPEN_STATS_EVERY = 30.0               # retry opening the panel this often
+SCAN_SHIFT, SCAN_E = 0x2A, 0x12
 
 u = ctypes.windll.user32
 g = ctypes.windll.gdi32
@@ -221,6 +241,12 @@ class Mover:
         self.altar = None                 # sacrifice circle center on the map
         self.cow_near_until = 0.0
         self.escort_until = 0.0
+        self.anchor = None                # settled: loop around this map point
+
+    def settle(self):
+        """Stop roaming: from now on only loop around the current spot."""
+        self.anchor = self.world.copy()
+        self.escort_until = 0.0
 
     def release(self):
         for k in self.held:
@@ -268,6 +294,9 @@ class Mover:
         if now < self.detour_until:       # stepping around a wall / crowd
             self.heading = self.detour_heading
             self.go(math.cos(self.heading), math.sin(self.heading), 0.6)
+            return
+        if self.anchor is not None:       # settled: sweep the orbs around us
+            self.circle_altar(now, dt, self.anchor, SETTLE_ORBIT)
             return
         orbs, mushrooms = scan_field(a)
         marker = event_marker(a)
@@ -587,6 +616,57 @@ def scan_field(a):
     return list(zip(xs * 2 - cx, ys * 2 - cy)), mushrooms
 
 
+# ---------------------------------------------------------------- clock ----
+
+def time_glyphs(g1080, y):
+    """Digit images (14x10) of one value row, left to right."""
+    a = g1080[y - 13:y + 13, TEMPS_X[0]:TEMPS_X[1]]
+    lab, _ = ndimage.label(a > 150)
+    out = []
+    for sl in sorted(ndimage.find_objects(lab), key=lambda s: s[1].start):
+        h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
+        if h < 10:
+            continue                      # colon dots
+        parts = max(1, round(w / 11.5)) if w > 14 else 1   # touching digits
+        for k in range(parts):
+            c0 = sl[1].start + w * k // parts
+            c1 = sl[1].start + w * (k + 1) // parts
+            g = Image.fromarray(a[sl[0].start:sl[0].stop, c0:c1].astype(np.uint8))
+            out.append(np.asarray(g.resize((10, 14), Image.BILINEAR), dtype=np.float32))
+    return out
+
+
+def game_time(img, title, digits):
+    """Seconds into the run from the spell stats panel, None if not shown."""
+    g1080 = np.asarray(img.convert("L").resize((1920, 1080)), dtype=np.float32)
+    x0, y0, x1, y1 = STATS_TITLE_BOX
+    if np.abs(g1080[y0:y1, x0:x1] - title).mean() >= STATS_TITLE_MATCH:
+        return None
+    best = None
+    for y in TEMPS_ROWS:
+        ds = []
+        for g in time_glyphs(g1080, y):
+            d = np.abs(digits - g).mean(axis=(1, 2))
+            if d.min() >= DIGIT_MATCH:
+                break
+            ds.append(int(d.argmin()))
+        else:
+            if 4 <= len(ds) <= 6 and ds[-2] < 6:   # MM:SS or H:MM:SS
+                t = 10 * ds[-2] + ds[-1] + 60 * (10 * ds[-4] + ds[-3])
+                if len(ds) > 4:
+                    t += 3600 * int("".join(map(str, ds[:-4])))
+                best = t if best is None else max(best, t)
+    return best
+
+
+def open_stats():
+    for scan in (SCAN_SHIFT, SCAN_E):
+        key(scan, True)
+        time.sleep(0.05)
+        key(scan, False)
+        time.sleep(0.25)
+
+
 # -------------------------------------------------------------- choices ----
 
 def wait_settled(h, hint):
@@ -763,10 +843,13 @@ def main():
     hint = np.asarray(Image.open(HINT_TEMPLATE).convert("L"), dtype=np.float32)
     infusion = np.asarray(Image.open(INFUSION_TEMPLATE).convert("L"), dtype=np.float32)
     icons = dict(np.load(PRIORITY_ICONS))   # mana_big/small, chance_big/small
+    stats_title = np.asarray(Image.open(STATS_TITLE).convert("L"), dtype=np.float32)
+    digits = np.load(TIME_DIGITS)
     move_on = "--no-move" not in sys.argv
     paused = False
     mover = Mover()
     stats = {"picks": 0}
+    clock_at = open_at = 0.0
     print("Spell Brigade bot running. F8 = pause/resume, F9 = toggle movement, Ctrl+C = quit.")
     print(f"Movement: {'on' if move_on else 'off'} (only while the game window is focused).")
     try:
@@ -792,6 +875,23 @@ def main():
             if np.abs(gray(small, HINT_BOX) - hint).mean() < MATCH_THRESHOLD:
                 handle_choices(h, hint, infusion, icons, mover, stats)
                 continue
+            now = time.time()
+            if now >= clock_at:
+                clock_at = now + CLOCK_EVERY
+                t = game_time(img, stats_title, digits)
+                if t is None:
+                    if now >= open_at and u.GetForegroundWindow() == h:
+                        open_at = now + OPEN_STATS_EVERY
+                        log("spell stats panel not shown -> opening it (Shift, E) for the game clock")
+                        mover.release()
+                        open_stats()
+                        clock_at = 0.0
+                elif t >= MOVE_FOR and mover.anchor is None:
+                    mover.settle()
+                    log(f"game time {t // 60}:{t % 60:02d} -> looping in place to pick up XP.")
+                elif t < MOVE_FOR and mover.anchor is not None:
+                    mover.anchor = None
+                    log(f"game time {t // 60}:{t % 60:02d} (new run) -> roaming again.")
             if move_on:
                 mover.tick(img, u.GetForegroundWindow() == h)
             busy = mover.held or time.time() < mover.escort_until
